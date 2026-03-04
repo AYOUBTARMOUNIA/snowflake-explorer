@@ -1,11 +1,11 @@
 import streamlit as st
-import snowflake.connector
+from snowflake.snowpark.context import get_active_session
 import pandas as pd
-from dotenv import load_dotenv
-import os
 
-load_dotenv()
+# ── Session Snowflake (injectée automatiquement par Snowflake) ────────────────
+session = get_active_session()
 
+# ── Configuration page ────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Snowflake Schema Explorer",
     page_icon="❄️",
@@ -15,141 +15,143 @@ st.set_page_config(
 st.title("❄️ Snowflake — Explorateur de Schéma")
 st.markdown("---")
 
-@st.cache_resource(show_spinner="Connexion à Snowflake…")
-def get_connection():
-    try:
-        conn = snowflake.connector.connect(
-            account=os.getenv("SNOWFLAKE_ACCOUNT"),
-            user=os.getenv("SNOWFLAKE_USER"),
-            password=os.getenv("SNOWFLAKE_PASSWORD"),
-            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
-            database=os.getenv("SNOWFLAKE_DATABASE"),
-            schema=os.getenv("SNOWFLAKE_SCHEMA"),
-            role=os.getenv("SNOWFLAKE_ROLE") or None,
-        )
-        return conn
-    except Exception as e:
-        st.error(f"❌ Erreur de connexion : {e}")
-        st.stop()
 
-def run_query(conn, query):
-    with conn.cursor() as cur:
-        cur.execute(query)
-        cols = [desc[0] for desc in cur.description]
-        rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=cols)
+# ── Helper ────────────────────────────────────────────────────────────────────
+def run_sql(query: str) -> pd.DataFrame:
+    """Exécute une requête SQL et retourne un DataFrame pandas."""
+    return session.sql(query).to_pandas()
 
+
+# ── Sidebar : sélection dynamique DB / Schema ─────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Paramètres")
-    conn = get_connection()
 
+    # Liste des bases de données
     try:
-        databases_df = run_query(conn, "SHOW DATABASES")
-        db_names = databases_df["name"].tolist()
-    except Exception:
-        db_names = [os.getenv("SNOWFLAKE_DATABASE", "")]
+        dbs_df = run_sql("SHOW DATABASES")
+        db_names = dbs_df["name"].tolist()
+    except Exception as e:
+        st.error(f"Impossible de lister les bases : {e}")
+        db_names = []
 
-    default_db = os.getenv("SNOWFLAKE_DATABASE", db_names[0])
-    selected_db = st.selectbox(
-        "Base de données",
-        db_names,
-        index=db_names.index(default_db) if default_db in db_names else 0,
-    )
+    selected_db = st.selectbox("🗄️ Base de données", db_names) if db_names else None
 
-    try:
-        schemas_df = run_query(conn, f"SHOW SCHEMAS IN DATABASE {selected_db}")
-        schema_names = schemas_df["name"].tolist()
-    except Exception:
-        schema_names = [os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")]
+    # Liste des schémas
+    schema_names = []
+    if selected_db:
+        try:
+            schemas_df = run_sql(f"SHOW SCHEMAS IN DATABASE {selected_db}")
+            schema_names = schemas_df["name"].tolist()
+        except Exception as e:
+            st.error(f"Impossible de lister les schémas : {e}")
 
-    default_schema = os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
-    selected_schema = st.selectbox(
-        "Schéma",
-        schema_names,
-        index=schema_names.index(default_schema) if default_schema in schema_names else 0,
-    )
+    selected_schema = st.selectbox("📂 Schéma", schema_names) if schema_names else None
 
     st.markdown("---")
-    st.caption(f"Connecté : **{os.getenv('SNOWFLAKE_USER')}**")
-    st.caption(f"Warehouse : **{os.getenv('SNOWFLAKE_WAREHOUSE')}**")
+    if selected_db and selected_schema:
+        st.success(f"**{selected_db}** › **{selected_schema}**")
 
+
+# ── Corps principal ───────────────────────────────────────────────────────────
+if not selected_db or not selected_schema:
+    st.info("👈 Sélectionnez une base de données et un schéma dans la barre latérale.")
+    st.stop()
+
+# Métriques en haut
 col1, col2, col3 = st.columns(3)
 col1.metric("Base de données", selected_db)
 col2.metric("Schéma", selected_schema)
 
+# ── Liste des tables ──────────────────────────────────────────────────────────
 st.subheader(f"📋 Tables dans `{selected_db}`.`{selected_schema}`")
 
 try:
-    tables_df = run_query(
-        conn,
-        f"""
-        SELECT TABLE_NAME, TABLE_TYPE, ROW_COUNT, BYTES, CREATED, LAST_ALTERED, COMMENT
+    tables_df = run_sql(f"""
+        SELECT
+            TABLE_NAME,
+            TABLE_TYPE,
+            ROW_COUNT,
+            BYTES,
+            CREATED,
+            LAST_ALTERED,
+            COMMENT
         FROM {selected_db}.INFORMATION_SCHEMA.TABLES
         WHERE TABLE_SCHEMA = '{selected_schema}'
         ORDER BY TABLE_NAME
-        """,
-    )
+    """)
 
-    col3.metric("Nombre de tables", len(tables_df))
+    col3.metric("Nb de tables", len(tables_df))
 
     if tables_df.empty:
         st.info("Aucune table trouvée dans ce schéma.")
-    else:
-        def format_bytes(b):
-            if pd.isna(b) or b == 0:
-                return "—"
-            for unit in ["B", "KB", "MB", "GB", "TB"]:
-                if b < 1024:
-                    return f"{b:.1f} {unit}"
-                b /= 1024
-            return f"{b:.1f} PB"
+        st.stop()
 
-        tables_df["SIZE"] = tables_df["BYTES"].apply(format_bytes)
-        tables_df["ROW_COUNT"] = tables_df["ROW_COUNT"].apply(
-            lambda x: f"{int(x):,}" if pd.notna(x) else "—"
-        )
+    # Formatage taille
+    def format_bytes(b):
+        if pd.isna(b) or b == 0:
+            return "—"
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if b < 1024:
+                return f"{b:.1f} {unit}"
+            b /= 1024
+        return f"{b:.1f} PB"
 
-        display_df = tables_df[
-            ["TABLE_NAME", "TABLE_TYPE", "ROW_COUNT", "SIZE", "CREATED", "LAST_ALTERED", "COMMENT"]
-        ].rename(columns={
-            "TABLE_NAME": "Nom", "TABLE_TYPE": "Type", "ROW_COUNT": "Nb lignes",
-            "SIZE": "Taille", "CREATED": "Créée le", "LAST_ALTERED": "Modifiée le", "COMMENT": "Commentaire",
-        })
+    tables_df["TAILLE"] = tables_df["BYTES"].apply(format_bytes)
+    tables_df["ROW_COUNT"] = tables_df["ROW_COUNT"].apply(
+        lambda x: f"{int(x):,}" if pd.notna(x) else "—"
+    )
 
-        search = st.text_input("🔍 Filtrer les tables", placeholder="Rechercher…")
-        if search:
-            mask = display_df["Nom"].str.contains(search, case=False, na=False)
-            display_df = display_df[mask]
+    display_df = tables_df[[
+        "TABLE_NAME", "TABLE_TYPE", "ROW_COUNT", "TAILLE", "CREATED", "LAST_ALTERED", "COMMENT"
+    ]].rename(columns={
+        "TABLE_NAME": "Nom",
+        "TABLE_TYPE": "Type",
+        "ROW_COUNT": "Nb lignes",
+        "TAILLE": "Taille",
+        "CREATED": "Créée le",
+        "LAST_ALTERED": "Modifiée le",
+        "COMMENT": "Commentaire",
+    })
 
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    # Recherche
+    search = st.text_input("🔍 Filtrer les tables", placeholder="Tapez un nom de table…")
+    if search:
+        mask = display_df["Nom"].str.contains(search, case=False, na=False)
+        display_df = display_df[mask]
+        st.caption(f"{len(display_df)} résultat(s)")
 
-        st.markdown("---")
-        st.subheader("🔎 Aperçu d'une table")
-        table_names = tables_df["TABLE_NAME"].tolist()
-        selected_table = st.selectbox("Choisir une table", ["— Aucune —"] + table_names)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        if selected_table != "— Aucune —":
-            limit = st.slider("Nb de lignes", 5, 500, 50, step=5)
-            with st.spinner(f"Chargement de {selected_table}…"):
-                try:
-                    preview_df = run_query(
-                        conn,
-                        f'SELECT * FROM "{selected_db}"."{selected_schema}"."{selected_table}" LIMIT {limit}',
-                    )
-                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
-                    with st.expander("📐 Structure des colonnes"):
-                        cols_df = run_query(
-                            conn,
-                            f"""
-                            SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COMMENT
-                            FROM {selected_db}.INFORMATION_SCHEMA.COLUMNS
-                            WHERE TABLE_SCHEMA = '{selected_schema}' AND TABLE_NAME = '{selected_table}'
-                            ORDER BY ORDINAL_POSITION
-                            """,
-                        )
-                        st.dataframe(cols_df, use_container_width=True, hide_index=True)
-                except Exception as e:
-                    st.error(f"Erreur : {e}")
+    # ── Aperçu d'une table ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🔎 Aperçu d'une table")
+
+    table_list = tables_df["TABLE_NAME"].tolist()
+    selected_table = st.selectbox("Choisir une table", ["— Aucune —"] + table_list)
+
+    if selected_table != "— Aucune —":
+        limit = st.slider("Nombre de lignes à afficher", 5, 1000, 100, step=5)
+
+        with st.spinner(f"Chargement de {selected_table}…"):
+            try:
+                preview_df = run_sql(
+                    f'SELECT * FROM "{selected_db}"."{selected_schema}"."{selected_table}" LIMIT {limit}'
+                )
+                st.caption(f"**{selected_table}** — {len(preview_df)} ligne(s) affichée(s)")
+                st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+                with st.expander("📐 Structure des colonnes"):
+                    cols_df = run_sql(f"""
+                        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COMMENT
+                        FROM {selected_db}.INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_SCHEMA = '{selected_schema}'
+                          AND TABLE_NAME   = '{selected_table}'
+                        ORDER BY ORDINAL_POSITION
+                    """)
+                    st.dataframe(cols_df, use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.error(f"Impossible de charger la table : {e}")
 
 except Exception as e:
-    st.error(f"Erreur : {e}")
+    st.error(f"Erreur lors de la récupération des tables : {e}")
